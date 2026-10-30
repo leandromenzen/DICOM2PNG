@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DICOM2PNG</title>
+<style>
+:root{--bg:#e8ecef;--panel:#fff;--ink:#17303f;--mute:#5d7280;--line:#c5d0d7;--acc:#1d6f82;--accink:#fff;--film:#0b0e10;--err:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#14191d;--panel:#1d2429;--ink:#e3eaee;--mute:#92a5b1;--line:#34424c;--acc:#4db3c8;--accink:#0b1a20;--err:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:980px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
+.sub{margin:0 0 22px;color:var(--mute);max-width:62ch}
+#drop{border:2px dashed var(--line);border-radius:10px;background:var(--panel);padding:34px 20px;text-align:center}
+#drop.over{border-color:var(--acc)}
+#drop p{margin:0 0 14px}
+button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 16px}
+button.main{background:var(--acc);border-color:var(--acc);color:var(--accink)}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+#bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:22px 0 14px;min-height:38px}
+#status{flex:1;color:var(--mute)}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+.thumb{aspect-ratio:1;background:var(--film);display:flex;align-items:center;justify-content:center}
+.thumb img{max-width:100%;max-height:100%;object-fit:contain}
+.info{padding:10px 12px;display:flex;flex-direction:column;gap:2px;font-size:13px}
+.info b{font-weight:600;overflow-wrap:anywhere}
+.info span{color:var(--mute)}
+.card.bad .info span{color:var(--err)}
+.info a{margin-top:6px;color:var(--acc);font-weight:600}
+</style>
+</head>
+<body>
+<main>
+<h1>DICOM2PNG</h1>
+<p class="sub">Selecione várias imagens DICOM e converta todas para PNG em escala de cinza. A conversão acontece no seu navegador: nenhum arquivo sai do computador.</p>
+<p class="sub">Select multiple DICOM images and convert them all to grayscale PNGs. The conversion takes place in your browser: no files ever leave your computer.</p>
+
+<div id="drop">
+  <p>Arraste arquivos DICOM para cá</p>
+  <p>Drag and drop DICOM files here.</p>
+  <div class="row">
+    <button class="main" id="pickFiles">Selecionar arquivos | Select Files </button>
+	
+    <button id="pickFolder">Selecionar pasta | Select Folder</button>
+  </div>
+</div>
+<input type="file" id="inFiles" multiple hidden>
+<input type="file" id="inFolder" webkitdirectory hidden>
+
+<div id="bar">
+  <div id="status" role="status" aria-live="polite"></div>
+  <button id="zipBtn" class="main" disabled>Baixar tudo | Download all (.zip)</button>
+  <button id="clearBtn" disabled>Limpar | Clean</button>
+</div>
+<p class="sub"> Developed by: @leandromenzen </p>
+<div id="grid"></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const LONG = new Set(['OB','OW','OF','SQ','UT','UN','OD','OL','UC','UR','OV','SV','UV']);
+const US_TAGS = new Set([0x280002,0x280006,0x280010,0x280011,0x280100,0x280103]);
+const STR_TAGS = new Set([0x280008]);
+let items = [], busy = false;
+
+/* ---------- Leitor DICOM (equivale a dicom.read_file + pixel_array) ---------- */
+function decodeDicom(buf){
+  const dv = new DataView(buf), len = buf.byteLength;
+  let little = true, explicit = true, p = 0, ts = '1.2.840.10008.1.2.1';
+  const u16 = o => dv.getUint16(o, little), u32 = o => dv.getUint32(o, little);
+  const str = (o, n) => { let s = ''; for(let i = 0; i < n; i++){ const c = dv.getUint8(o + i); if(c) s += String.fromCharCode(c); } return s.trim(); };
+
+  if(len > 132 && str(128, 4) === 'DICM'){
+    p = 132;
+    while(p + 8 <= len && dv.getUint16(p, true) === 2){            // cabeçalho (grupo 0002), sempre little endian explícito
+      const e = dv.getUint16(p + 2, true), vr = str(p + 4, 2);
+      let l, h;
+      if(LONG.has(vr)){ l = dv.getUint32(p + 8, true); h = 12; } else { l = dv.getUint16(p + 6, true); h = 8; }
+      if(e === 0x10) ts = str(p + h, l);
+      p += h + l;
+    }
+  } else { ts = '1.2.840.10008.1.2'; }                              // sem prefixo "DICM": assume implícito
+  const LOSSLESS = ts === '1.2.840.10008.1.2.4.70' || ts === '1.2.840.10008.1.2.4.57';   // JPEG Lossless
+  if(!LOSSLESS && /^1\.2\.840\.10008\.1\.2\.(4|5|1\.99)/.test(ts)) throw new Error('Formato comprimido (' + ts + ') não suportado. Formatos aceitos: sem compressão e JPEG Lossless.');
+  if(ts === '1.2.840.10008.1.2') explicit = false;
+  if(ts === '1.2.840.10008.1.2.2') little = false;
+
+  const T = {}; let pix = null, jpeg = null;
+  function walk(q, top){
+    while(q + 8 <= len){
+      const g = u16(q), e = u16(q + 2);
+      if(g === 0xFFFE){                                             // item ou delimitador de sequência
+        const l = u32(q + 4); q += 8;
+        if(e === 0xE00D || e === 0xE0DD) return q;
+        if(l === 0xFFFFFFFF) q = walk(q, false); else q += l;
+        continue;
+      }
+      let vr = '', l, h = 8;
+      if(explicit){ vr = str(q + 4, 2); if(LONG.has(vr)){ l = u32(q + 8); h = 12; } else l = u16(q + 6); }
+      else l = u32(q + 4);
+      q += h;
+      if(l === 0xFFFFFFFF){
+        if(top && g === 0x7FE0 && e === 0x10){
+          if(!LOSSLESS) throw new Error('Pixel Data encapsulado (comprimido) não suportado.');
+          const fr = [];                                              // fragmentos; o primeiro item é a tabela de offsets
+          while(q + 8 <= len){ const ig = u16(q), ie = u16(q + 2), il = u32(q + 4); q += 8; if(ig !== 0xFFFE || ie !== 0xE000) break; fr.push(new Uint8Array(buf, q, il)); q += il; }
+          jpeg = fr.slice(1); return q;
+        }
+        q = walk(q, false); continue;
+      }
+      if(top){
+        const tag = g * 65536 + e;
+        if(tag === 0x7FE00010){ pix = [q, l]; return q; }
+        if(US_TAGS.has(tag)) T[tag] = u16(q);
+        else if(STR_TAGS.has(tag)) T[tag] = str(q, l);
+      }
+      q += l;
+    }
+    return q;
+  }
+  walk(p, true);
+  let jf = null;
+  if(jpeg){
+    const all = new Uint8Array(jpeg.reduce((a, b) => a + b.length, 0)); let o = 0;
+    for(const f of jpeg){ all.set(f, o); o += f.length; }
+    jf = []; const want = Math.max(1, parseInt(T[0x280008]) || 1);
+    for(let pos = 0; jf.length < want && pos + 4 < all.length;){ const r = decodeLossless(all, pos); jf.push(r); pos = r.end; }
+    if(!jf.length) throw new Error('JPEG Lossless sem dados de imagem.');
+    pix = [0, 0]; T[0x280010] = jf[0].h; T[0x280011] = jf[0].w; T[0x280002] = jf[0].nc;
+    T[0x280100] = T[0x280100] || (jf[0].P > 8 ? 16 : 8);
+  }
+
+  const rows = T[0x280010], cols = T[0x280011], bits = T[0x280100] || 8, spp = T[0x280002] || 1;
+  if(!pix || !rows || !cols) throw new Error('Não é uma imagem DICOM (sem dados de pixel).');
+  if(![8,16,32].includes(bits)) throw new Error('Profundidade de ' + bits + ' bits não suportada.');
+  const signed = T[0x280103] === 1, planar = T[0x280006] === 1, bps = bits / 8;
+  const px = rows * cols, fsize = px * spp * bps;
+  const nFrames = jf ? jf.length : Math.min(Math.max(1, parseInt(T[0x280008]) || 1), Math.floor(pix[1] / fsize));
+  if(nFrames < 1) throw new Error('Dados de pixel incompletos.');
+  const rd = bits === 8 ? o => dv.getUint8(o)
+    : bits === 16 ? (signed ? o => dv.getInt16(o, little) : o => dv.getUint16(o, little))
+    : (signed ? o => dv.getInt32(o, little) : o => dv.getUint32(o, little));
+
+  const frames = [];
+  for(let f = 0; f < nFrames; f++){
+    const base = pix[0] + f * fsize, vals = new Float64Array(px * spp);
+    let max = 0;
+    for(let i = 0; i < px * spp; i++){
+      let v;
+      if(jf){ v = jf[f].data[i]; if(signed){ const sh = 32 - jf[f].P; v = (v << sh) >> sh; } }
+      else { const c = i % spp; v = rd(base + (planar ? c * px + (i - c) / spp : i) * bps); }
+      vals[i] = v; if(v > max) max = v;
+    }
+    // Reescala o cinza para 0-255 dividindo pelo valor máximo, como no script original
+    const scale = (spp === 1 || bits > 8) ? (max > 0 ? 255 / max : 0) : 1;
+    const rgba = new Uint8ClampedArray(px * 4);
+    for(let i = 0; i < px; i++){
+      const a = i * spp, o = i * 4;
+      rgba[o] = Math.floor(vals[a] * scale);
+      rgba[o+1] = spp >= 3 ? Math.floor(vals[a+1] * scale) : rgba[o];
+      rgba[o+2] = spp >= 3 ? Math.floor(vals[a+2] * scale) : rgba[o];
+      rgba[o+3] = 255;
+    }
+    frames.push({w: cols, h: rows, rgba});
+  }
+  return frames;
+}
+
+/* ---------- JPEG Lossless (SOF3): sintaxes 1.2.840.10008.1.2.4.57 e .70 ---------- */
+function decodeLossless(u8, p){
+  if(u8[p] !== 0xFF || u8[p + 1] !== 0xD8) throw new Error('Fragmento JPEG inválido.');
+  p += 2;
+  const hts = [], tab = []; let sof = null, ri = 0, ss = 1, pt = 0;
+  while(p + 4 <= u8.length){                                        // cabeçalho: DHT, SOF3, DRI até o SOS
+    if(u8[p] !== 0xFF){ p++; continue; }
+    const m = u8[p + 1], L = (u8[p + 2] << 8) | u8[p + 3];
+    if(m === 0xFF){ p++; continue; }
+    if(m === 0xC4){
+      for(let q = p + 4; q < p + 2 + L;){
+        const cnt = u8.subarray(q + 1, q + 17), n = cnt.reduce((a, b) => a + b, 0);
+        const maxc = new Int32Array(17).fill(-1), minc = new Int32Array(17), vp = new Int32Array(17);
+        for(let l = 1, code = 0, k = 0; l <= 16; l++){ vp[l] = k; minc[l] = code; code += cnt[l - 1]; k += cnt[l - 1]; if(cnt[l - 1]) maxc[l] = code - 1; code <<= 1; }
+        hts[u8[q] & 15] = {maxc, minc, vp, v: u8.subarray(q + 17, q + 17 + n)};
+        q += 17 + n;
+      }
+    } else if(m === 0xC3){
+      sof = {P: u8[p + 4], h: (u8[p + 5] << 8) | u8[p + 6], w: (u8[p + 7] << 8) | u8[p + 8], nc: u8[p + 9]};
+    } else if(m === 0xDD){
+      ri = (u8[p + 4] << 8) | u8[p + 5];
+    } else if(m === 0xDA){
+      if(!sof) throw new Error('JPEG sem cabeçalho SOF3.');
+      const ns = u8[p + 4];
+      for(let i = 0; i < ns; i++) tab[i] = hts[u8[p + 6 + 2 * i] >> 4];
+      ss = u8[p + 5 + 2 * ns]; pt = u8[p + 7 + 2 * ns] & 15;
+      p += 2 + L; break;
+    } else if(m >= 0xC0 && m <= 0xCF && ![0xC8, 0xCC].includes(m)){
+      throw new Error('JPEG não é lossless (marcador FF' + m.toString(16).toUpperCase() + ').');
+    }
+    p += 2 + L;
+  }
+  const {P, w, h, nc} = sof;
+  if(P > 16 || !nc || tab.some(t => !t)) throw new Error('JPEG Lossless com parâmetros não suportados.');
+  const out = new Uint16Array(w * h * nc), mask = (1 << P) - 1, def = 1 << (P - pt - 1);
+  let bb = 0, bc = 0;
+  const bit = () => {
+    if(!bc){
+      let b = u8[p];
+      if(b === 0xFF){ if(u8[p + 1] === 0) p += 2; else b = 0; } else p++;   // FF00 = byte 0xFF; outro marcador: completa com zeros
+      bb = b; bc = 8;
+    }
+    return (bb >> --bc) & 1;
+  };
+  const huff = t => {
+    for(let l = 1, c = 0; l <= 16; l++){ c = (c << 1) | bit(); if(t.maxc[l] >= 0 && c <= t.maxc[l]) return t.v[t.vp[l] + c - t.minc[l]]; }
+    throw new Error('Código Huffman inválido no JPEG.');
+  };
+  let mcu = 0;
+  for(let y = 0; y < h; y++) for(let x = 0; x < w; x++, mcu++){
+    const restart = ri && mcu && mcu % ri === 0;
+    if(restart){ bc = 0; while(p + 1 < u8.length && !(u8[p] === 0xFF && u8[p + 1] >= 0xD0 && u8[p + 1] <= 0xD7)) p++; p += 2; }
+    for(let c = 0; c < nc; c++){
+      const s = huff(tab[c]); let d = 0;
+      if(s === 16) d = 32768;
+      else if(s){ for(let k = 0; k < s; k++) d = (d << 1) | bit(); if(d < (1 << (s - 1))) d -= (1 << s) - 1; }
+      const i = (y * w + x) * nc + c, ra = x ? out[i - nc] : 0, rb = y ? out[i - w * nc] : 0, rc = x && y ? out[i - w * nc - nc] : 0;
+      let pr;
+      if(mcu === 0 || restart) pr = def;
+      else if(!y) pr = ra;
+      else if(!x) pr = rb;
+      else switch(ss){
+        case 1: pr = ra; break; case 2: pr = rb; break; case 3: pr = rc; break;
+        case 4: pr = ra + rb - rc; break; case 5: pr = ra + ((rb - rc) >> 1); break;
+        case 6: pr = rb + ((ra - rc) >> 1); break; default: pr = (ra + rb) >> 1;
+      }
+      out[i] = (pr + d) & mask;
+    }
+  }
+  if(pt) for(let i = 0; i < out.length; i++) out[i] = (out[i] << pt) & 0xFFFF;
+  while(p + 1 < u8.length && !(u8[p] === 0xFF && u8[p + 1] === 0xD9)) p++;   // vai até o EOI
+  return {w, h, nc, P, data: out, end: p + 2};
+}
+
+function toPng(fr){
+  const c = document.createElement('canvas'); c.width = fr.w; c.height = fr.h;
+  c.getContext('2d').putImageData(new ImageData(fr.rgba, fr.w, fr.h), 0, 0);
+  return new Promise(r => c.toBlob(r, 'image/png'));
+}
+
+/* ---------- Interface ---------- */
+function addCard(it){
+  items.push(it);
+  const card = document.createElement('div'); card.className = 'card' + (it.error ? ' bad' : '');
+  const base = it.name.split('/').pop();
+  if(it.error){
+    card.innerHTML = '<div class="info"><b></b><span></span></div>';
+    card.querySelector('b').textContent = base; card.querySelector('span').textContent = 'Erro: ' + it.error;
+  } else {
+    card.innerHTML = '<div class="thumb"><img alt=""></div><div class="info"><b></b><span></span><a>Baixar PNG</a></div>';
+    card.querySelector('img').src = it.url;
+    card.querySelector('b').textContent = base;
+    card.querySelector('span').textContent = it.w + ' × ' + it.h + ' px';
+    const a = card.querySelector('a'); a.href = it.url; a.download = base;
+  }
+  $('#grid').appendChild(card);
+}
+
+function updateStatus(done, total){
+  const ok = items.filter(i => i.blob).length, bad = items.length - ok;
+  $('#status').textContent = done < total ? 'Convertendo ' + (done + 1) + ' de ' + total + '…'
+    : ok + ' convertido' + (ok === 1 ? '' : 's') + (bad ? ', ' + bad + ' com erro' : '') + '.';
+  $('#zipBtn').disabled = busy || !ok; $('#clearBtn').disabled = busy || !items.length;
+}
+
+async function handle(list){
+  list = [...list]; if(!list.length || busy) return;
+  busy = true; updateStatus(0, list.length);
+  for(let i = 0; i < list.length; i++){
+    const f = list[i], rel = f.webkitRelativePath || f.name;
+    updateStatus(i, list.length);
+    await new Promise(r => setTimeout(r));                          // deixa a tela atualizar
+    try{
+      const frames = decodeDicom(await f.arrayBuffer());
+      for(let k = 0; k < frames.length; k++){
+        const blob = await toPng(frames[k]);
+        addCard({name: (frames.length > 1 ? rel + '_frame' + (k + 1) : rel) + '.png', blob, url: URL.createObjectURL(blob), w: frames[k].w, h: frames[k].h});
+      }
+    } catch(err){ addCard({name: rel, error: err.message}); }
+  }
+  busy = false; updateStatus(list.length, list.length);
+}
+
+/* ---------- ZIP (sem compressão) ---------- */
+const CRC = (() => { const t = new Uint32Array(256); for(let n = 0; n < 256; n++){ let c = n; for(let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = d => { let c = -1; for(let i = 0; i < d.length; i++) c = CRC[(c ^ d[i]) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; };
+const put = (dv, l) => l.forEach(([o, v, s]) => s === 4 ? dv.setUint32(o, v, true) : dv.setUint16(o, v, true));
+function zip(files){
+  const enc = new TextEncoder(), out = [], cen = []; let off = 0, cenSize = 0;
+  for(const f of files){
+    const n = enc.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    put(lh, [[0,0x04034b50,4],[4,20,2],[6,0x800,2],[12,0x21,2],[14,crc,4],[18,sz,4],[22,sz,4],[26,n.length,2]]);
+    const ch = new DataView(new ArrayBuffer(46));
+    put(ch, [[0,0x02014b50,4],[4,20,2],[6,20,2],[8,0x800,2],[14,0x21,2],[16,crc,4],[20,sz,4],[24,sz,4],[28,n.length,2],[42,off,4]]);
+    out.push(new Uint8Array(lh.buffer), n, f.data); cen.push(new Uint8Array(ch.buffer), n);
+    off += 30 + n.length + sz; cenSize += 46 + n.length;
+  }
+  const end = new DataView(new ArrayBuffer(22));
+  put(end, [[0,0x06054b50,4],[8,files.length,2],[10,files.length,2],[12,cenSize,4],[16,off,4]]);
+  return new Blob([...out, ...cen, end.buffer], {type: 'application/zip'});
+}
+function save(blob, name){
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+async function downloadZip(){
+  const used = new Set(), files = [];
+  for(const it of items.filter(i => i.blob)){
+    let n = it.name, k = 1; while(used.has(n)) n = it.name.replace(/\.png$/, '_' + (++k) + '.png');
+    used.add(n); files.push({name: n, data: new Uint8Array(await it.blob.arrayBuffer())});
+  }
+  save(zip(files), 'dicom-png.zip');
+}
+
+/* ---------- Eventos ---------- */
+$('#pickFiles').onclick = () => $('#inFiles').click();
+$('#pickFolder').onclick = () => $('#inFolder').click();
+for(const id of ['#inFiles', '#inFolder']) $(id).onchange = e => { handle(e.target.files); e.target.value = ''; };
+$('#zipBtn').onclick = downloadZip;
+$('#clearBtn').onclick = () => { items.forEach(i => i.url && URL.revokeObjectURL(i.url)); items = []; $('#grid').innerHTML = ''; $('#status').textContent = ''; $('#zipBtn').disabled = $('#clearBtn').disabled = true; };
+const drop = $('#drop');
+['dragenter','dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => handle(e.dataTransfer.files));
+</script>
+</body>
+</html>
